@@ -1,0 +1,118 @@
+diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
+index 83329387..0a72603e 100644
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -161,6 +161,9 @@ const blink::UserAgentBrandList GetUserAgentBrandList(
+   std::optional<std::string> brand;
+ #if !BUILDFLAG(CHROMIUM_BRANDING)
+   brand = version_info::GetProductName();
++#else
++  // ANDROID STEALTH: retain the Chrome brand on branded Android builds.
++  brand = "Google Chrome";
+ #endif
+ 
+   std::string brand_version =
+@@ -446,9 +449,7 @@ std::string BuildUserAgentFromProduct(const std::string& product) {
+ // depending on the Reduce User-Agent reduction phase features.
+ std::string GetUserAgentInternal() {
+   std::string product = GetProductAndVersion();
+-  if (base::CommandLine::ForCurrentProcess()->HasSwitch(kHeadless)) {
+-    product.insert(0, "Headless");
+-  }
++  // ANDROID STEALTH: do not add the Headless prefix to the product name.
+ 
+ #if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_IOS)
+   if (base::CommandLine::ForCurrentProcess()->HasSwitch(kUseMobileUserAgent)) {
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index 16c56bb3..55e5fad6 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -4075,6 +4075,9 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
+       switches::kEnableLowEndDeviceMode,
+       switches::kDisableLowEndDeviceMode,
+       switches::kDisallowNonExactResourceReuse,
++      // STEALTH PATCH (phase 3): forward the fingerprint-noise seed to
++      // renderer processes.
++      "stealth-seed",
+ #if BUILDFLAG(IS_ANDROID)
+       switches::kDisableMediaSessionAPI,
+       switches::kRendererWaitForJavaDebugger,
+diff --git a/third_party/blink/renderer/core/frame/navigator.cc b/third_party/blink/renderer/core/frame/navigator.cc
+index 72964f48..eff93cc0 100644
+--- a/third_party/blink/renderer/core/frame/navigator.cc
++++ b/third_party/blink/renderer/core/frame/navigator.cc
+@@ -79,12 +79,9 @@ bool Navigator::cookieEnabled() const {
+ }
+ 
+ bool Navigator::webdriver() const {
+-  if (RuntimeEnabledFeatures::AutomationControlledEnabled())
+-    return true;
+-
+-  bool automation_enabled = false;
+-  probe::ApplyAutomationOverride(GetExecutionContext(), automation_enabled);
+-  return automation_enabled;
++  // STEALTH PATCH (phase 1): never report automation control, even when
++  // driven through DevTools/CDP.
++  return false;
+ }
+ 
+ String Navigator::GetAcceptLanguages() {
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+index d4d74d39..f50cfd7f 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -18,6 +18,9 @@
+ #include "base/byte_size.h"
+ #include "base/check.h"
+ #include "base/check_op.h"
++#include "base/command_line.h"
++#include "base/compiler_specific.h"
++#include "base/containers/span.h"
+ #include "base/feature_list.h"
+ #include "base/location.h"
+ #include "base/memory/safety_checks.h"
+@@ -28,6 +31,7 @@
+ #include "base/notreached.h"
+ #include "base/numerics/checked_math.h"
+ #include "base/numerics/safe_conversions.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/single_thread_task_runner.h"
+@@ -164,6 +168,83 @@ bool IsContextProviderValid() {
+          !context_provider_wrapper->ContextProvider().IsContextLost();
+ }
+ 
++// STEALTH PATCH (phase 3): fingerprint-noise seed. `--stealth-seed=N`
++// overrides the built-in default; the same seed always yields the same
++// noise, so repeated reads of one canvas stay consistent.
++uint32_t StealthSeed() {
++  static const uint32_t seed = [] {
++    const std::string value =
++        base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++            "stealth-seed");
++    uint32_t parsed = 0;
++    if (!value.empty() && base::StringToUint(value, &parsed)) {
++      return parsed;
++    }
++    return 0x5EEDC10Au;
++  }();
++  return seed;
++}
++
++// Deterministic 32-bit hash of (seed, x, y); splitmix32-style finalizer.
++uint32_t StealthPixelHash(uint32_t seed, uint32_t x, uint32_t y) {
++  uint32_t h = seed + 0x9E3779B9u + x * 0x85EBCA6Bu + y * 0xC2B2AE35u;
++  h ^= h >> 16;
++  h *= 0x7FEB352Du;
++  h ^= h >> 15;
++  h *= 0x846CA68Bu;
++  h ^= h >> 16;
++  return h;
++}
++
++// Flip the LSB of one channel in ~1/64 of the pixels inside
++// [min_x, max_x) x [min_y, max_y) (canvas coordinates). Invisible (+/-1),
++// deterministic per (seed, x, y), and identical across readback paths, so
++// getImageData and toDataURL agree with each other.
++void PerturbPixmap(SkPixmap&
